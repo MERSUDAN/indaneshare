@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuickBeam – send files between phone and computer</title>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+:root{--bg:#eef3f5;--card:#fff;--ink:#14232b;--mute:#5b6e78;--line:#cfdbe1;--acc:#0a6c8f;--acc-ink:#fff;--ok:#16794a;--bad:#b3261e;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1a20;--card:#17262e;--ink:#e6f0f4;--mute:#9bb1bc;--line:#2b3f49;--acc:#4cc0e6;--acc-ink:#06212b;--ok:#5fd59a;--bad:#ff8a80;color-scheme:dark}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:560px;margin:0 auto;padding:max(24px,env(safe-area-inset-top)) 18px max(32px,env(safe-area-inset-bottom))}
+h1{font-size:1.9rem;margin:0 0 4px;letter-spacing:-.02em}
+.sub{color:var(--mute);margin:0 0 22px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:16px}
+#qrwrap{display:flex;justify-content:center;margin-bottom:14px}
+#qr{background:#fff;padding:14px;border-radius:10px;line-height:0}
+#qr img,#qr canvas{max-width:100%;height:auto}
+.row{display:flex;gap:8px}
+input[type=text]{flex:1;min-width:0;padding:10px;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--ink);font:inherit;font-size:.85rem}
+button,.btn{font:inherit;font-weight:600;border:0;border-radius:8px;padding:10px 16px;background:var(--acc);color:var(--acc-ink);cursor:pointer}
+button:focus-visible,.drop:focus-within,input:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
+.status{display:flex;align-items:center;gap:10px;margin-bottom:16px;font-weight:600}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--mute);flex:none}
+.status.ok .dot{background:var(--ok)}.status.bad .dot{background:var(--bad)}
+.note{font-size:.85rem;color:var(--mute);margin:10px 0 0}
+.warn{color:var(--bad)}
+.drop{display:block;text-align:center;padding:34px 16px;border:2px dashed var(--line);border-radius:12px;cursor:pointer;font-weight:600}
+.drop.over{border-color:var(--acc);background:color-mix(in srgb,var(--acc) 10%,transparent)}
+.item{border-top:1px solid var(--line);padding:12px 0}
+.item:first-child{border-top:0}
+.top{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+.name{font-weight:600;overflow-wrap:anywhere}
+.meta{color:var(--mute);font-size:.82rem;white-space:nowrap}
+progress{width:100%;height:8px;margin-top:8px;accent-color:var(--acc)}
+a.dl{display:inline-block;margin-top:8px;color:var(--acc);font-weight:700}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<main>
+  <h1>QuickBeam</h1>
+  <p class="sub">Send files between your phone and computer, device to device. No account, no upload to a server, works on any network.</p>
+
+  <div class="status" id="status" role="status" aria-live="polite"><span class="dot"></span><span id="stext">Starting…</span></div>
+
+  <section class="card" id="pair" hidden>
+    <div id="qrwrap"><div id="qr"></div></div>
+    <p id="hint" style="margin:0 0 12px">Scan this code with your phone camera to connect.</p>
+    <div class="row"><input type="text" id="link" readonly aria-label="Connection link"><button id="copy" type="button">Copy link</button></div>
+    <p class="note" id="fileWarn" hidden></p>
+    <p class="note">Only the first device that opens this link can connect. Files are encrypted in transit and go straight between the two devices.</p>
+  </section>
+
+  <section class="card" id="xfer" hidden>
+    <label class="drop" id="drop" tabindex="-1">
+      <input type="file" id="file" multiple hidden>
+      Choose files to send, or drop them here
+    </label>
+    <p class="note">Keep this page open on both devices while files are moving.</p>
+    <div id="list" style="margin-top:8px"></div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const ICE = [
+  {urls:'stun:stun.l.google.com:19302'},
+  {urls:'stun:global.stun.twilio.com:3478'},
+  // Free public relay, used only when a direct link is impossible. May be slow or unavailable.
+  {urls:['turn:openrelay.metered.ca:80','turn:openrelay.metered.ca:443','turn:openrelay.metered.ca:443?transport=tcp'],username:'openrelayproject',credential:'openrelayproject'}
+];
+const ALPHA = 'abcdefghijklmnopqrstuvwxyz23456789';
+const rid = n => Array.from(crypto.getRandomValues(new Uint8Array(n)), b => ALPHA[b % ALPHA.length]).join('');
+const fmt = n => n < 1024 ? n + ' B' : n < 1048576 ? (n/1024).toFixed(1) + ' KB' : n < 1073741824 ? (n/1048576).toFixed(1) + ' MB' : (n/1073741824).toFixed(2) + ' GB';
+const CHUNK = 16 * 1024;
+
+let peer, conn, rx = null, queue = Promise.resolve();
+
+function setStatus(text, cls){
+  $('stext').textContent = text;
+  $('status').className = 'status ' + (cls || '');
+}
+
+function start(){
+  if(!window.Peer){ setStatus('Could not load the connection library. Check your internet and reload.', 'bad'); return; }
+  const hostId = location.hash.slice(1);
+  if(hostId){ guest(hostId); } else { host(); }
+}
+
+function host(){
+  const id = 'qb-' + rid(14);
+  peer = new Peer(id, {config:{iceServers:ICE}});
+  peer.on('open', () => {
+    const url = location.href.split('#')[0] + '#' + id;
+    $('pair').hidden = false;
+    $('link').value = url;
+    new QRCode($('qr'), {text:url, width:220, height:220, correctLevel:QRCode.CorrectLevel.M});
+    if(location.protocol === 'file:'){
+      $('fileWarn').hidden = false;
+      $('fileWarn').className = 'note warn';
+      $('fileWarn').textContent = 'This page is opened from a local file, so your phone cannot open the link. Upload this file to a static host first (see the instructions).';
+    }
+    setStatus('Waiting for your phone to scan…');
+  });
+  peer.on('connection', c => {
+    if(conn){ c.on('open', () => c.close()); return; }
+    setup(c);
+  });
+  peer.on('disconnected', () => { if(!conn) peer.reconnect(); });
+  peer.on('error', e => setStatus('Connection problem: ' + e.type + '. Reload to start a new session.', 'bad'));
+}
+
+function guest(hostId){
+  history.replaceState(null, '', location.pathname + location.search);
+  peer = new Peer({config:{iceServers:ICE}});
+  setStatus('Connecting to your computer…');
+  peer.on('open', () => setup(peer.connect(hostId, {reliable:true, serialization:'raw'})));
+  peer.on('error', e => setStatus(e.type === 'peer-unavailable'
+    ? 'That session has expired or was already used. Reload the page on your computer for a new code.'
+    : 'Connection problem: ' + e.type + '.', 'bad'));
+}
+
+function setup(c){
+  conn = c;
+  c.on('open', () => {
+    $('pair').hidden = true; $('xfer').hidden = false;
+    setStatus('Connected. Pick files on either device.', 'ok');
+  });
+  c.on('data', onData);
+  c.on('close', () => { $('xfer').hidden = true; setStatus('Disconnected. Reload both pages to start again.', 'bad'); });
+  c.on('error', e => setStatus('Connection problem: ' + (e.type || e) + '.', 'bad'));
+}
+
+/* ---------- sending ---------- */
+function addRow(name, size){
+  const el = document.createElement('div');
+  el.className = 'item';
+  el.innerHTML = '<div class="top"><span class="name"></span><span class="meta"></span></div><progress max="100" value="0"></progress>';
+  el.querySelector('.name').textContent = name;
+  el.querySelector('.meta').textContent = fmt(size);
+  $('list').prepend(el);
+  return {el, bar:el.querySelector('progress'), meta:el.querySelector('.meta')};
+}
+
+async function sendFile(f){
+  const row = addRow(f.name, f.size);
+  const dc = conn.dataChannel;
+  dc.bufferedAmountLowThreshold = 1 << 20;
+  conn.send(JSON.stringify({t:'meta', name:f.name, size:f.size, type:f.type}));
+  let off = 0;
+  while(off < f.size){
+    if(dc.bufferedAmount > (4 << 20)) await new Promise(r => dc.addEventListener('bufferedamountlow', r, {once:true}));
+    const buf = await f.slice(off, off + CHUNK).arrayBuffer();
+    conn.send(buf);
+    off += buf.byteLength;
+    row.bar.value = off / f.size * 100;
+  }
+  conn.send(JSON.stringify({t:'end'}));
+  row.bar.value = 100;
+  row.meta.textContent = fmt(f.size) + ' · sent';
+}
+
+function enqueue(files){
+  [...files].forEach(f => { queue = queue.then(() => sendFile(f)).catch(() => setStatus('A file could not be sent. Check the connection.', 'bad')); });
+}
+
+/* ---------- receiving ---------- */
+function onData(d){
+  if(typeof d === 'string'){
+    const m = JSON.parse(d);
+    if(m.t === 'meta'){
+      rx = {m, parts:[], got:0, row:addRow(m.name, m.size)};
+    } else if(m.t === 'end' && rx){
+      const blob = new Blob(rx.parts, {type:rx.m.type || 'application/octet-stream'});
+      const a = document.createElement('a');
+      a.className = 'dl'; a.href = URL.createObjectURL(blob); a.download = rx.m.name; a.textContent = 'Save ' + rx.m.name;
+      rx.row.el.appendChild(a);
+      rx.row.bar.value = 100;
+      rx.row.meta.textContent = fmt(rx.m.size) + ' · received';
+      rx = null;
+    }
+    return;
+  }
+  if(!rx) return;
+  rx.parts.push(d);
+  rx.got += d.byteLength;
+  rx.row.bar.value = rx.got / rx.m.size * 100;
+}
+
+/* ---------- UI wiring ---------- */
+$('file').addEventListener('change', e => { enqueue(e.target.files); e.target.value = ''; });
+const drop = $('drop');
+['dragenter','dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e => enqueue(e.dataTransfer.files));
+$('copy').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText($('link').value); $('copy').textContent = 'Copied'; }
+  catch { $('link').select(); }
+  setTimeout(() => $('copy').textContent = 'Copy link', 1500);
+});
+window.addEventListener('beforeunload', e => { if(conn && conn.open){ e.preventDefault(); } });
+start();
+</script>
+</body>
+</html>
